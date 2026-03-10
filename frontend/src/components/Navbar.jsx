@@ -29,7 +29,7 @@ export default function Navbar() {
         ? "rgba(10, 22, 40, 0.95)"
         : "transparent",
       backdropFilter: scrolled ? "blur(12px)" : "none",
-      borderBottom: scrolled ? "1px solid rgba(255,255,255,0.06)" : "none",
+      borderBottom: "1px solid rgba(255,255,255,0.06)",
     }}>
       <div style={{
         maxWidth: 1200, margin: "0 auto", padding: "0 24px",
