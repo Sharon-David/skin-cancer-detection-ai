@@ -33,7 +33,7 @@ function ConfidenceBar({ value, color }) {
     }}>
       <div style={{
         height: "100%",
-        width: `${(value * 100).toFixed(1)}%`,
+        width: `${value.toFixed(1)}%`,
         borderRadius: 3,
         background: color,
         transition: "width 1s cubic-bezier(0.4, 0, 0.2, 1)",
@@ -58,7 +58,7 @@ export default function ResultDisplay({ result, previewImage }) {
 
   const isMalignant = prediction === "Malignant";
   const probMalignant = typeof prob_malignant === "number" ? prob_malignant : 0;
-  const probBenign = 1 - probMalignant;
+  const probBenign = 100 - probMalignant;
   const confidenceVal = typeof confidence === "number" ? confidence : 0;
 
   const predColor = isMalignant ? "#f87171" : "#34d399";
@@ -118,7 +118,7 @@ export default function ResultDisplay({ result, previewImage }) {
                 Model confidence
               </span>
               <span style={{ fontSize: 13, fontWeight: 700, color: "var(--white)" }}>
-                {(confidenceVal * 100).toFixed(1)}%
+                {confidenceVal.toFixed(1)}%
               </span>
             </div>
             <ConfidenceBar value={confidenceVal} color={predColor} />
@@ -142,7 +142,7 @@ export default function ResultDisplay({ result, previewImage }) {
                   {label}
                 </p>
                 <p style={{ fontSize: 22, fontWeight: 700, color, fontVariantNumeric: "tabular-nums" }}>
-                  {(value * 100).toFixed(1)}%
+                  {value.toFixed(1)}%
                 </p>
                 <div style={{ marginTop: 8 }}>
                   <ConfidenceBar value={value} color={color} />

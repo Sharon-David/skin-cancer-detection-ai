@@ -1,8 +1,11 @@
 """
-finetune_ddi.py — Step 2 of sequential fine-tuning pipeline
-=============================================================
+finetune_ddi.py — Step 2: Mixed HAM10000 + DDI training
+=========================================================
+Problem with DDI-only: only 656 images — too small to fine-tune alone.
+Solution: mix DDI with HAM10000 (oversample DDI to match HAM10000 scale).
+This teaches the model skin tone diversity without forgetting dermoscopy.
+
 Foundation : ham10000_baseline.keras (AUC 0.769)
-Goal       : Improve fairness across skin tones using DDI dataset
 Output     : ddi_finetuned.keras
 
 Usage:
@@ -10,8 +13,6 @@ Usage:
 """
 
 import os
-import sys
-
 os.environ["TF_XLA_FLAGS"]          = "--tf_xla_auto_jit=0"
 os.environ["TF_ENABLE_XLA"]         = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "2"
@@ -34,9 +35,12 @@ import albumentations as A
 # ── Config ────────────────────────────────────────────────────────────────────
 IMG_SIZE        = 224
 BATCH_SIZE      = 8
+WARMUP_EPOCHS   = 5
 FINETUNE_EPOCHS = 30
-FINETUNE_LR     = 1e-6      # Very small — preserve HAM10000 knowledge
+WARMUP_LR       = 1e-4
+FINETUNE_LR     = 1e-6
 UNFREEZE_LAYERS = 20
+DDI_OVERSAMPLE  = 8    # Repeat DDI samples 8x to match HAM10000 scale
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +51,10 @@ FOUNDATION_MODEL = os.path.join(SAVED_DIR, "ham10000_baseline.keras")
 WARMUP_CKPT      = os.path.join(SAVED_DIR, "ddi_warmup.keras")
 OUTPUT_MODEL     = os.path.join(SAVED_DIR, "ddi_finetuned.keras")
 HISTORY_PATH     = os.path.join(SAVED_DIR, "ddi_history.pkl")
+
+HAM_DIR        = os.path.join(BACKEND_DIR, "data", "ham10000")
+HAM_IMAGES_DIR = os.path.join(HAM_DIR, "images")
+HAM_META       = os.path.join(HAM_DIR, "HAM10000_metadata.csv")
 
 DDI_DIR        = os.path.join(BACKEND_DIR, "data", "ddi")
 DDI_IMAGES_DIR = os.path.join(DDI_DIR, "images")
@@ -61,96 +69,77 @@ if gpus:
         print(f"✓ GPU: {[g.name for g in gpus]}")
     except RuntimeError as e:
         print(f"GPU error: {e}")
-else:
-    print("⚠ No GPU detected — training on CPU")
 
 print(f"\n── Config ──")
-print(f"Foundation : {FOUNDATION_MODEL}")
-print(f"Output     : {OUTPUT_MODEL}")
-print(f"LR         : {FINETUNE_LR}  (tiny — preserve HAM10000 knowledge)")
-print(f"Unfreeze   : {UNFREEZE_LAYERS} layers")
+print(f"Foundation       : {FOUNDATION_MODEL}")
+print(f"DDI oversample   : {DDI_OVERSAMPLE}x (to balance with HAM10000)")
+print(f"Finetune LR      : {FINETUNE_LR}")
 
 # ── Load foundation model ─────────────────────────────────────────────────────
 print(f"\n── Loading foundation model ──")
-if not os.path.exists(FOUNDATION_MODEL):
-    raise FileNotFoundError(f"Foundation model not found: {FOUNDATION_MODEL}")
-
 model = tf.keras.models.load_model(FOUNDATION_MODEL)
-print(f"✓ Loaded. Total layers: {len(model.layers)}")
+print(f"✓ Loaded. Layers: {len(model.layers)}")
 
-# ── Load DDI metadata ─────────────────────────────────────────────────────────
-print(f"\n── Loading DDI dataset ──")
-df = pd.read_csv(DDI_META)
-print(f"Columns: {list(df.columns)}")
+# ── Load HAM10000 ─────────────────────────────────────────────────────────────
+print(f"\n── Loading HAM10000 ──")
+ham_df = pd.read_csv(HAM_META)
+ham_df["image_path"] = ham_df["image_id"].apply(
+    lambda x: os.path.join(HAM_IMAGES_DIR, f"{x}.jpg"))
+ham_df = ham_df[ham_df["image_path"].apply(os.path.exists)].copy()
+malignant_classes = ["mel", "bcc", "akiec"]
+ham_df["label"] = ham_df["dx"].apply(lambda x: 1 if x in malignant_classes else 0)
+ham_df["source"] = "ham10000"
+print(f"HAM10000: {len(ham_df)} images  (mal={ham_df['label'].sum()}, ben={(ham_df['label']==0).sum()})")
 
-# Build image paths
-def find_image(row):
-    for col in ["DDI_file", "file", "image_file", "filename", "image_id"]:
-        if col in row.index:
-            fname = str(row[col])
-            full  = os.path.join(DDI_IMAGES_DIR, fname)
-            if os.path.exists(full):
-                return full
-            full = os.path.join(DDI_IMAGES_DIR, os.path.basename(fname))
-            if os.path.exists(full):
-                return full
-    return None
+# ── Load DDI ──────────────────────────────────────────────────────────────────
+print(f"\n── Loading DDI ──")
+ddi_df = pd.read_csv(DDI_META)
+ddi_df["image_path"] = ddi_df["DDI_file"].apply(
+    lambda x: os.path.join(DDI_IMAGES_DIR, str(x)))
+ddi_df = ddi_df[ddi_df["image_path"].apply(os.path.exists)].copy()
+ddi_df["label"] = ddi_df["malignant"].astype(str).str.lower().map(
+    {"true": 1, "false": 0}).fillna(0).astype(int)
+ddi_df["source"] = "ddi"
+print(f"DDI: {len(ddi_df)} images  (mal={ddi_df['label'].sum()}, ben={(ddi_df['label']==0).sum()})")
+print(f"Skin tones: {ddi_df['skin_tone'].value_counts().to_dict()}")
 
-df["image_path"] = df.apply(find_image, axis=1)
-df = df[df["image_path"].notna()].copy()
-print(f"Images found: {len(df)}")
+# ── Split both datasets ───────────────────────────────────────────────────────
+ham_train, ham_val = train_test_split(
+    ham_df, test_size=0.2, stratify=ham_df["label"], random_state=42)
+ddi_train, ddi_val = train_test_split(
+    ddi_df, test_size=0.2, stratify=ddi_df["label"], random_state=42)
 
-# Detect label column
-label_col = None
-for col in ["malignant", "label", "diagnosis", "benign_malignant"]:
-    if col in df.columns:
-        label_col = col
-        break
-if label_col is None:
-    raise ValueError(f"Cannot find label column. Columns: {list(df.columns)}")
+# ── Oversample DDI in training set ───────────────────────────────────────────
+ddi_train_oversampled = pd.concat([ddi_train] * DDI_OVERSAMPLE, ignore_index=True)
+print(f"\nDDI train after {DDI_OVERSAMPLE}x oversample: {len(ddi_train_oversampled)}")
 
-sample = df[label_col].iloc[0]
-if isinstance(sample, bool) or str(sample).lower() in ("true", "false"):
-    df["label"] = df[label_col].astype(str).str.lower().map({"true": 1, "false": 0}).fillna(0).astype(int)
-elif df[label_col].dtype in [np.int64, np.float64]:
-    df["label"] = df[label_col].astype(int)
-else:
-    malignant_terms = ["malignant", "melanoma", "bcc", "scc"]
-    df["label"] = df[label_col].str.lower().apply(
-        lambda x: 1 if any(t in str(x) for t in malignant_terms) else 0)
+# ── Combine: HAM10000 + oversampled DDI ──────────────────────────────────────
+train_df = pd.concat([ham_train, ddi_train_oversampled], ignore_index=True)
+# Val: keep separate so we can evaluate fairly on each
+val_df   = pd.concat([ham_val, ddi_val], ignore_index=True)
 
-print(f"Malignant : {df['label'].sum()} ({df['label'].mean()*100:.1f}%)")
-print(f"Benign    : {(df['label']==0).sum()} ({(1-df['label'].mean())*100:.1f}%)")
-
-# Skin tone breakdown if available
-for col in ["skin_tone", "fitzpatrick", "fitzpatrick_scale"]:
-    if col in df.columns:
-        print(f"\nSkin tone distribution ({col}):")
-        print(df[col].value_counts())
-        break
-
-# ── Train / val split ─────────────────────────────────────────────────────────
-train_df, val_df = train_test_split(
-    df, test_size=0.2, stratify=df["label"], random_state=42)
-print(f"\nTrain: {len(train_df)}  |  Val: {len(val_df)}")
+print(f"\nCombined train : {len(train_df)}")
+print(f"Combined val   : {len(val_df)}")
+print(f"  HAM10000 val : {len(ham_val)}")
+print(f"  DDI val      : {len(ddi_val)}")
 
 # ── Sample weights ────────────────────────────────────────────────────────────
 n_neg        = (train_df["label"] == 0).sum()
 n_pos        = (train_df["label"] == 1).sum()
 weight_for_0 = 1.0
-weight_for_1 = float(np.sqrt(float(n_neg) / float(n_pos))) if n_pos > 0 else 1.0
-print(f"Sample weight: malignant = {weight_for_1:.2f}x benign")
+weight_for_1 = float(np.sqrt(float(n_neg) / float(n_pos)))
+print(f"\nSample weight: malignant = {weight_for_1:.2f}x benign")
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 train_transform = A.Compose([
     A.Resize(IMG_SIZE, IMG_SIZE),
     A.RandomRotate90(),
-    A.Flip(),
+    A.HorizontalFlip(),
     A.Transpose(p=0.3),
     A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
     A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, p=0.5),
-    A.GaussNoise(p=0.3),
-    A.CoarseDropout(max_holes=8, max_height=20, max_width=20, p=0.3),
+    A.GaussNoise(p=0.2),
+    A.CoarseDropout(max_holes=8, max_height=16, max_width=16, p=0.2),
     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
 ])
 
@@ -188,21 +177,19 @@ steps_val   = max(1, len(val_df)   // BATCH_SIZE)
 print(f"Steps/epoch: train={steps_train}, val={steps_val}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Short warmup with DDI (head only, base frozen)
+# PHASE 1 — Short warmup (head only)
 # ══════════════════════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
-print(f"PHASE 1: Head warmup on DDI — 5 epochs, base FROZEN")
+print(f"PHASE 1: Head warmup — {WARMUP_EPOCHS} epochs")
 print(f"{'='*60}")
 
-# Freeze entire base
 for layer in model.layers:
     layer.trainable = False
-# Unfreeze head (last 4 layers = dense layers)
 for layer in model.layers[-4:]:
     layer.trainable = True
 
 model.compile(
-    optimizer=Adam(learning_rate=1e-4),
+    optimizer=Adam(learning_rate=WARMUP_LR),
     loss="binary_crossentropy",
     metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
     run_eagerly=True,
@@ -216,30 +203,33 @@ cb_warmup = [
 ]
 
 h1 = model.fit(
-    data_generator(train_df, train_transform, BATCH_SIZE, shuffle=True,  weighted=True),
+    data_generator(train_df, train_transform, BATCH_SIZE, shuffle=True, weighted=True),
     steps_per_epoch=steps_train,
     validation_data=data_generator(val_df, val_transform, BATCH_SIZE, shuffle=False, weighted=False),
     validation_steps=steps_val,
-    epochs=5,
+    epochs=WARMUP_EPOCHS,
     callbacks=cb_warmup,
 )
 best_p1 = max(h1.history["val_auc"])
 print(f"\n✓ Phase 1 complete. Best val_auc = {best_p1:.4f}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Fine-tune top layers on DDI
+# PHASE 2 — Fine-tune top layers
 # ══════════════════════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
-print(f"PHASE 2: Fine-tuning top {UNFREEZE_LAYERS} layers on DDI")
-print(f"  LR = {FINETUNE_LR}  (tiny — must not destroy HAM10000 knowledge)")
+print(f"PHASE 2: Fine-tuning top {UNFREEZE_LAYERS} layers")
 print(f"{'='*60}")
 
-# Load best warmup weights before unfreezing
 model.load_weights(WARMUP_CKPT)
 print(f"✓ Loaded warmup checkpoint")
 
-# Get the base model (first layer that is EfficientNet)
-base_model = model.layers[1] if hasattr(model.layers[1], 'layers') else None
+# Unfreeze top N layers of base model
+base_model = None
+for layer in model.layers:
+    if hasattr(layer, 'layers') and len(layer.layers) > 10:
+        base_model = layer
+        break
+
 if base_model:
     base_model.trainable = True
     for layer in base_model.layers[:-UNFREEZE_LAYERS]:
@@ -247,12 +237,8 @@ if base_model:
     unfrozen = sum(1 for l in base_model.layers if l.trainable)
     print(f"Unfrozen: {unfrozen} / {len(base_model.layers)} base layers")
 else:
-    # Fallback: unfreeze top N layers of whole model
-    for layer in model.layers:
-        layer.trainable = False
     for layer in model.layers[-(UNFREEZE_LAYERS + 4):]:
         layer.trainable = True
-    print(f"Unfrozen top {UNFREEZE_LAYERS + 4} layers of full model")
 
 model.compile(
     optimizer=Adam(learning_rate=FINETUNE_LR),
@@ -271,7 +257,7 @@ cb_finetune = [
 ]
 
 h2 = model.fit(
-    data_generator(train_df, train_transform, BATCH_SIZE, shuffle=True,  weighted=True),
+    data_generator(train_df, train_transform, BATCH_SIZE, shuffle=True, weighted=True),
     steps_per_epoch=steps_train,
     validation_data=data_generator(val_df, val_transform, BATCH_SIZE, shuffle=False, weighted=False),
     validation_steps=steps_val,
@@ -285,32 +271,55 @@ for k in h1.history:
     combined[k] = h1.history[k] + h2.history.get(k, [])
 with open(HISTORY_PATH, "wb") as f:
     pickle.dump(combined, f)
-print(f"\n✓ History saved: {HISTORY_PATH}")
+print(f"\n✓ History saved")
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
-print("\nEvaluating on DDI validation set...")
-val_gen = data_generator(val_df, val_transform, BATCH_SIZE, shuffle=False, weighted=False)
+print("\n── Evaluating on HAM10000 val (regression test) ──")
+ham_gen = data_generator(ham_val, val_transform, BATCH_SIZE, shuffle=False, weighted=False)
 y_true, y_proba = [], []
-for _ in range(steps_val):
-    imgs, lbls = next(val_gen)
+for _ in range(max(1, len(ham_val) // BATCH_SIZE)):
+    imgs, lbls = next(ham_gen)
     preds = model.predict(imgs, verbose=0)
     y_true.extend(lbls)
     y_proba.extend(preds.flatten())
+ham_auc = roc_auc_score(np.array(y_true), np.array(y_proba))
+print(f"HAM10000 val AUC : {ham_auc:.4f}  (baseline was 0.7691 — should be close)")
 
-y_true  = np.array(y_true)
-y_proba = np.array(y_proba)
-auc     = roc_auc_score(y_true, y_proba)
+print("\n── Evaluating on DDI val (fairness test) ──")
+ddi_gen = data_generator(ddi_val, val_transform, BATCH_SIZE, shuffle=False, weighted=False)
+y_true, y_proba = [], []
+for _ in range(max(1, len(ddi_val) // BATCH_SIZE)):
+    imgs, lbls = next(ddi_gen)
+    preds = model.predict(imgs, verbose=0)
+    y_true.extend(lbls)
+    y_proba.extend(preds.flatten())
+ddi_auc = roc_auc_score(np.array(y_true), np.array(y_proba))
+print(f"DDI val AUC      : {ddi_auc:.4f}")
 
-print("\n── Classification report (threshold=0.4) ──")
-y_pred = (y_proba > 0.4).astype(int)
-print(classification_report(y_true, y_pred, target_names=["Benign", "Malignant"]))
+# Per skin tone AUC
+ddi_val_copy = ddi_val.copy().reset_index(drop=True)
+print("\n── DDI AUC per skin tone ──")
+for tone in sorted(ddi_val_copy["skin_tone"].unique()):
+    mask   = ddi_val_copy["skin_tone"] == tone
+    subset = ddi_val_copy[mask]
+    if len(subset) < 10:
+        continue
+    gen = data_generator(subset, val_transform, BATCH_SIZE, shuffle=False, weighted=False)
+    yt, yp = [], []
+    for _ in range(max(1, len(subset) // BATCH_SIZE)):
+        imgs, lbls = next(gen)
+        preds = model.predict(imgs, verbose=0)
+        yt.extend(lbls); yp.extend(preds.flatten())
+    if len(set(yt)) > 1:
+        tone_auc = roc_auc_score(np.array(yt), np.array(yp))
+        print(f"  Skin tone {tone}: AUC={tone_auc:.4f}  (n={len(subset)})")
 
 print(f"\n{'='*60}")
-print("SUMMARY — DDI Fine-tuning")
+print("SUMMARY — DDI Mixed Fine-tuning")
 print(f"{'='*60}")
 print(f"Phase 1 best val_auc : {best_p1:.4f}")
 print(f"Phase 2 best val_auc : {max(h2.history['val_auc']):.4f}")
-print(f"Final ROC-AUC        : {auc:.4f}")
+print(f"HAM10000 val AUC     : {ham_auc:.4f}  (was 0.7691)")
+print(f"DDI val AUC          : {ddi_auc:.4f}")
 print(f"Model saved to       : {OUTPUT_MODEL}")
-print()
-print(f"Next: python backend/models/finetune_pad_ufes.py")
+print(f"\nNext: python backend/models/finetune_pad_ufes.py")
