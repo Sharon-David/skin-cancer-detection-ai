@@ -9,3 +9,5 @@ scikit-learn
 albumentations
 tensorflow
 python-dotenv
+mlflow
+prometheus-client
