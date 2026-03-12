@@ -174,7 +174,7 @@ export default function ResultDisplay({ result, previewImage }) {
           </p>
           <HeatmapOverlay
             originalImage={previewImage}
-            heatmapImage={`data:image/png;base64,${gradcam_image}`}
+            heatmapBase64={gradcam_image}
           />
         </div>
       )}

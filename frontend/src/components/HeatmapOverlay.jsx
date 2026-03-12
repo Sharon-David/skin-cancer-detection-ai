@@ -68,7 +68,7 @@ export default function HeatmapOverlay({ originalImage, heatmapBase64 }) {
               width: "100%", height: "100%",
               objectFit: "contain",
               opacity: opacity,
-              mixBlendMode: "screen",
+              mixBlendMode: "multiply",
               transition: "opacity 0.2s ease",
             }}
           />
