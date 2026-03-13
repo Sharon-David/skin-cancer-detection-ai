@@ -1,140 +1,222 @@
 """
-inference.py — Model loading, prediction, and Monte Carlo uncertainty estimation
+inference.py — Ensemble inference for skin cancer detection
+============================================================
+Model priority:
+  1. Ensemble: ham10000_baseline + pad_ufes_finetuned (best)
+  2. Single:   ham10000_baseline (dermoscopy only)
+
+Domain shift finding:
+  - HAM10000 model: trained on dermoscopy images
+  - PAD-UFES model: trained on smartphone clinical photos
+  - Ensemble: averages both, robust across image types
 """
+
 import os
 import io
+import base64
 import numpy as np
 from PIL import Image
 import tensorflow as tf
 import albumentations as A
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_XLA"]        = "0"
-os.environ["TF_XLA_FLAGS"]         = "--tf_xla_auto_jit=0"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(BASE_DIR)
+SAVED_DIR   = os.path.join(BACKEND_DIR, "saved_models")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-IMG_SIZE   = 224
-MC_SAMPLES = 20   # Monte Carlo dropout forward passes
+MODEL_PATHS = {
+    "dermoscopy": os.path.join(SAVED_DIR, "ham10000_baseline.keras"),
+    "smartphone": os.path.join(SAVED_DIR, "pad_ufes_finetuned.keras"),
+    "ddi":        os.path.join(SAVED_DIR, "ddi_finetuned.keras"),
+}
 
-BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAVED_DIR  = os.path.join(BASE_DIR, "saved_models")
+IMG_SIZE = 224
 
-# Model priority: use best available model
-def _find_model():
-    candidates = [
-        "pad_ufes_finetuned.keras",
-        "ddi_finetuned.keras",
-        "ham10000_baseline.keras",
-    ]
-    for name in candidates:
-        path = os.path.join(SAVED_DIR, name)
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"No model found in {SAVED_DIR}")
-
-MODEL_PATH = _find_model()
-
-# ── Lazy singleton ────────────────────────────────────────────────────────────
-_model = None
-
-def get_model():
-    global _model
-    if _model is None:
-        print(f"Loading model: {MODEL_PATH}")
-        _model = tf.keras.models.load_model(MODEL_PATH)
-        print(f"✓ Model loaded ({len(_model.layers)} layers)")
-    return _model
-
-# ── Preprocessing ─────────────────────────────────────────────────────────────
-val_transform = A.Compose([
+transform = A.Compose([
     A.Resize(IMG_SIZE, IMG_SIZE),
     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
 ])
 
-def preprocess(image_bytes: bytes) -> np.ndarray:
-    img    = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    arr    = np.array(img)
-    arr    = val_transform(image=arr)["image"]
-    return np.expand_dims(arr, axis=0).astype(np.float32)
+# ── Model loader ──────────────────────────────────────────────────────────────
+_models = {}
 
-# ── Risk helpers ──────────────────────────────────────────────────────────────
-def get_risk_level(prob: float) -> str:
-    if prob >= 75:  return "High"
-    if prob >= 40:  return "Medium"
-    return "Low"
+def _load_model(key: str):
+    if key not in _models:
+        path = MODEL_PATHS[key]
+        if os.path.exists(path):
+            print(f"Loading model: {key} from {path}")
+            _models[key] = tf.keras.models.load_model(path)
+        else:
+            _models[key] = None
+    return _models[key]
 
-def get_recommendation(prob: float) -> str:
-    if prob >= 75:
-        return "High probability of malignancy detected. Please consult a dermatologist promptly."
-    if prob >= 40:
-        return "Moderate risk detected. Consider a dermatologist consultation for further evaluation."
-    return "Low risk detected. Continue regular skin self-examinations and annual dermatologist checkups."
+def get_available_models():
+    available = []
+    for key, path in MODEL_PATHS.items():
+        if os.path.exists(path):
+            available.append(key)
+    return available
 
-# ── Standard prediction ───────────────────────────────────────────────────────
-def predict(image_bytes: bytes) -> dict:
-    model          = get_model()
-    x              = preprocess(image_bytes)
-    prob_malignant = float(model.predict(x, verbose=0)[0][0]) * 100
-    prob_benign    = 100.0 - prob_malignant
-    is_malignant   = prob_malignant >= 50
-    confidence     = prob_malignant if is_malignant else prob_benign
+def _preprocess(pil_image: Image.Image) -> np.ndarray:
+    img = pil_image.convert("RGB")
+    img = np.array(img)
+    img = transform(image=img)["image"]
+    return np.expand_dims(img, axis=0).astype(np.float32)
+
+# ── Risk level helper ─────────────────────────────────────────────────────────
+def _risk_level(prob: float) -> tuple[str, str]:
+    if prob >= 0.7:
+        return "High", "Consult a dermatologist promptly."
+    elif prob >= 0.4:
+        return "Moderate", "Monitor closely and consider a dermatologist visit."
+    else:
+        return "Low", "Low concern, but monitor for changes."
+
+# ── Single model predict ──────────────────────────────────────────────────────
+def predict(pil_image: Image.Image) -> dict:
+    """Single model prediction using best available model."""
+    img = _preprocess(pil_image)
+
+    # Load best single model
+    model = _load_model("dermoscopy")
+    if model is None:
+        raise RuntimeError("No model available")
+
+    prob = float(model.predict(img, verbose=0)[0][0])
+    risk, recommendation = _risk_level(prob)
 
     return {
-        "prediction":      "Malignant" if is_malignant else "Benign",
-        "confidence":      round(confidence, 1),
-        "prob_malignant":  round(prob_malignant, 1),
-        "prob_benign":     round(prob_benign, 1),
-        "risk_level":      get_risk_level(prob_malignant),
-        "recommendation":  get_recommendation(prob_malignant),
-        "disclaimer":      "This is a research tool only. Not a medical device. Always consult a qualified dermatologist.",
-        "gradcam_image":   None,
-        "uncertainty":     None,
+        "prediction":    "Malignant" if prob >= 0.5 else "Benign",
+        "confidence":    round(max(prob, 1 - prob) * 100, 1),
+        "prob_malignant": round(prob * 100, 1),
+        "prob_benign":    round((1 - prob) * 100, 1),
+        "risk_level":    risk,
+        "recommendation": recommendation,
+        "model_used":    "dermoscopy",
+        "disclaimer":    "Research tool only. Not a clinical diagnosis.",
     }
 
-# ── Monte Carlo Dropout uncertainty estimation ────────────────────────────────
-def predict_with_uncertainty(image_bytes: bytes) -> dict:
-    """
-    Run MC_SAMPLES forward passes with dropout ENABLED.
-    Returns mean prediction + uncertainty (std deviation).
-    Wide std = model is uncertain = tell user to see a doctor.
-    """
-    model = get_model()
-    x     = preprocess(image_bytes)
-
-    # Run multiple stochastic forward passes (dropout stays ON)
+# ── Monte Carlo uncertainty ───────────────────────────────────────────────────
+def _mc_predict(model, img: np.ndarray, n_samples: int = 20) -> tuple[float, float]:
+    """Run MC dropout inference."""
     preds = []
-    for _ in range(MC_SAMPLES):
-        # training=True keeps dropout active during inference
-        p = model(x, training=True).numpy()[0][0]
+    for _ in range(n_samples):
+        p = float(model(img, training=True)[0][0])
         preds.append(p)
+    return float(np.mean(preds)), float(np.std(preds))
 
-    preds          = np.array(preds)
-    mean_prob      = float(np.mean(preds)) * 100
-    std_prob       = float(np.std(preds))  * 100   # uncertainty
-    prob_benign    = 100.0 - mean_prob
-    is_malignant   = mean_prob >= 50
-    confidence     = mean_prob if is_malignant else prob_benign
+# ── ENSEMBLE predict (main function) ─────────────────────────────────────────
+def predict_with_uncertainty(pil_image: Image.Image) -> dict:
+    """
+    Ensemble prediction with uncertainty estimation.
+    
+    Uses dermoscopy model + smartphone model if both available.
+    Falls back to single model with MC dropout if only one available.
+    
+    Returns full result including:
+    - ensemble prediction + confidence
+    - per-model predictions (for frontend display)
+    - uncertainty estimate
+    - domain shift note if models disagree significantly
+    """
+    img = _preprocess(pil_image)
 
-    # Uncertainty interpretation
-    if std_prob > 15:
-        uncertainty_label = "High — model is uncertain, strongly recommend clinical review"
-    elif std_prob > 8:
-        uncertainty_label = "Moderate — consider clinical review"
+    derm_model = _load_model("dermoscopy")
+    sphone_model = _load_model("smartphone")
+
+    available = []
+    if derm_model is not None:
+        available.append("dermoscopy")
+    if sphone_model is not None:
+        available.append("smartphone")
+
+    if not available:
+        raise RuntimeError("No models available")
+
+    # ── Single model fallback ──────────────────────────────────────────────────
+    if len(available) == 1:
+        model = derm_model or sphone_model
+        mean_prob, std_prob = _mc_predict(model, img)
+
+        if std_prob > 0.15:
+            uncertainty_label = "High"
+        elif std_prob > 0.08:
+            uncertainty_label = "Moderate"
+        else:
+            uncertainty_label = "Low"
+
+        risk, recommendation = _risk_level(mean_prob)
+
+        return {
+            "prediction":      "Malignant" if mean_prob >= 0.5 else "Benign",
+            "confidence":      round(max(mean_prob, 1 - mean_prob) * 100, 1),
+            "prob_malignant":  round(mean_prob * 100, 1),
+            "prob_benign":     round((1 - mean_prob) * 100, 1),
+            "risk_level":      risk,
+            "recommendation":  recommendation,
+            "model_used":      available[0],
+            "ensemble":        False,
+            "uncertainty": {
+                "std":   round(std_prob * 100, 1),
+                "label": uncertainty_label,
+                "samples": 20,
+            },
+            "per_model": {
+                available[0]: round(mean_prob * 100, 1),
+            },
+            "domain_shift_note": None,
+            "disclaimer": "Research tool only. Not a clinical diagnosis.",
+        }
+
+    # ── Ensemble: both models available ──────────────────────────────────────
+    derm_mean,   derm_std   = _mc_predict(derm_model,   img, n_samples=20)
+    sphone_mean, sphone_std = _mc_predict(sphone_model, img, n_samples=20)
+
+    # Weighted average — dermoscopy model has higher validated AUC
+    derm_weight   = 0.55
+    sphone_weight = 0.45
+    ensemble_prob = derm_weight * derm_mean + sphone_weight * sphone_mean
+    ensemble_std  = np.sqrt(
+        derm_weight**2 * derm_std**2 + sphone_weight**2 * sphone_std**2
+    )
+
+    # Domain shift detection — models disagree significantly
+    model_disagreement = abs(derm_mean - sphone_mean)
+    domain_shift_note = None
+    if model_disagreement > 0.25:
+        domain_shift_note = (
+            f"Models disagree by {round(model_disagreement*100)}% — "
+            f"image may have features atypical for both dermoscopy and smartphone domains. "
+            f"Higher uncertainty applies."
+        )
+
+    if ensemble_std > 0.15:
+        uncertainty_label = "High"
+    elif ensemble_std > 0.08:
+        uncertainty_label = "Moderate"
     else:
-        uncertainty_label = "Low — model is confident"
+        uncertainty_label = "Low"
+
+    risk, recommendation = _risk_level(ensemble_prob)
 
     return {
-        "prediction":       "Malignant" if is_malignant else "Benign",
-        "confidence":       round(confidence, 1),
-        "prob_malignant":   round(mean_prob, 1),
-        "prob_benign":      round(prob_benign, 1),
-        "risk_level":       get_risk_level(mean_prob),
-        "recommendation":   get_recommendation(mean_prob),
-        "disclaimer":       "This is a research tool only. Not a medical device. Always consult a qualified dermatologist.",
-        "gradcam_image":    None,
-        "uncertainty":      {
-            "std":   round(std_prob, 1),
-            "label": uncertainty_label,
-            "samples": MC_SAMPLES,
+        "prediction":     "Malignant" if ensemble_prob >= 0.5 else "Benign",
+        "confidence":     round(max(ensemble_prob, 1 - ensemble_prob) * 100, 1),
+        "prob_malignant": round(ensemble_prob * 100, 1),
+        "prob_benign":    round((1 - ensemble_prob) * 100, 1),
+        "risk_level":     risk,
+        "recommendation": recommendation,
+        "model_used":     "ensemble",
+        "ensemble":       True,
+        "uncertainty": {
+            "std":     round(float(ensemble_std) * 100, 1),
+            "label":   uncertainty_label,
+            "samples": 20,
         },
+        "per_model": {
+            "dermoscopy": round(derm_mean * 100, 1),
+            "smartphone": round(sphone_mean * 100, 1),
+        },
+        "domain_shift_note": domain_shift_note,
+        "disclaimer": "Research tool only. Not a clinical diagnosis.",
     }
